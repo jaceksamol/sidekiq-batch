@@ -20,7 +20,11 @@ module Sidekiq
       @initialized = false
       @created_at = Time.now.utc.to_f
       @bidkey = "BID-" + @bid.to_s
-      @ready_to_queue = []
+      @queued_jids = []
+      @pending_jids = []
+
+      @incremental_push = !Sidekiq.default_configuration[:batch_push_interval].nil?
+      @batch_push_interval = Sidekiq.default_configuration[:batch_push_interval]
     end
 
     def description=(description)
@@ -43,10 +47,10 @@ module Sidekiq
       callback_key = "#{@bidkey}-callbacks-#{event}"
       Sidekiq.redis do |r|
         r.multi do |pipeline|
-          pipeline.sadd(callback_key, JSON.unparse({
+          pipeline.sadd(callback_key, [JSON.unparse({
             callback: callback,
             opts: options
-          }))
+          })])
           pipeline.expire(callback_key, BID_EXPIRE_TTL)
         end
       end
@@ -64,51 +68,86 @@ module Sidekiq
           Sidekiq.redis do |r|
             r.multi do |pipeline|
               pipeline.hset(@bidkey, "created_at", @created_at)
-              pipeline.hset(@bidkey, "parent_bid", parent_bid.to_s) if parent_bid
               pipeline.expire(@bidkey, BID_EXPIRE_TTL)
+              if parent_bid
+                pipeline.hset(@bidkey, "parent_bid", parent_bid.to_s)
+                pipeline.hincrby("BID-#{parent_bid}", "children", 1)
+              end
             end
           end
 
           @initialized = true
         end
 
-        @ready_to_queue = []
+        @queued_jids = []
+        @pending_jids = []
 
         begin
           parent = Thread.current[:batch]
           Thread.current[:batch] = self
+          Thread.current[:parent_bid] = parent_bid
           yield
         ensure
           Thread.current[:batch] = parent
+          Thread.current[:parent_bid] = nil
         end
 
-        return [] if @ready_to_queue.size == 0
+        return [] if @queued_jids.size == 0
+        conditional_redis_increment!(true)
 
         Sidekiq.redis do |r|
           r.multi do |pipeline|
             if parent_bid
-              pipeline.hincrby("BID-#{parent_bid}", "children", 1)
-              pipeline.hincrby("BID-#{parent_bid}", "total", @ready_to_queue.size)
               pipeline.expire("BID-#{parent_bid}", BID_EXPIRE_TTL)
             end
 
-            pipeline.hincrby(@bidkey, "pending", @ready_to_queue.size)
-            pipeline.hincrby(@bidkey, "total", @ready_to_queue.size)
             pipeline.expire(@bidkey, BID_EXPIRE_TTL)
 
-            pipeline.sadd(@bidkey + "-jids", @ready_to_queue)
+            pipeline.sadd(@bidkey + "-jids", @queued_jids)
             pipeline.expire(@bidkey + "-jids", BID_EXPIRE_TTL)
           end
         end
 
-        @ready_to_queue
+        @queued_jids
       ensure
         Thread.current[:bid_data] = bid_data
       end
     end
 
     def increment_job_queue(jid)
-      @ready_to_queue << jid
+      @queued_jids << jid
+      @pending_jids << jid
+      conditional_redis_increment!
+    end
+
+    def conditional_redis_increment!(force=false)
+      if should_increment? || force
+        parent_bid = Thread.current[:parent_bid]
+        Sidekiq.redis do |r|
+          r.multi do |pipeline|
+            if parent_bid
+              pipeline.hincrby("BID-#{parent_bid}", "total", @pending_jids.length)
+              pipeline.expire("BID-#{parent_bid}", BID_EXPIRE_TTL)
+            end
+
+            pipeline.hincrby(@bidkey, "pending", @pending_jids.length)
+            pipeline.hincrby(@bidkey, "total", @pending_jids.length)
+            pipeline.expire(@bidkey, BID_EXPIRE_TTL)
+          end
+        end
+        @pending_jids = []
+      end
+    end
+
+    def should_increment?
+      return false unless @incremental_push
+      return true if @batch_push_interval == 0 || @queued_jids.length == 1
+      now = Time.now.to_f
+      @last_increment ||= now
+      if @last_increment + @batch_push_interval > now
+        @last_increment = now
+        return true
+      end
     end
 
     def invalidate_all
@@ -130,7 +169,7 @@ module Sidekiq
     end
 
     def valid?(batch = self)
-      valid = !Sidekiq.redis { |r| r.exists("invalidated-bid-#{batch.bid}") }
+      valid = Sidekiq.redis { |r| r.exists("invalidated-bid-#{batch.bid}") }.zero?
       batch.parent ? valid && valid?(batch.parent) : valid
     end
 
@@ -149,7 +188,7 @@ module Sidekiq
       def process_failed_job(bid, jid)
         _, pending, failed, children, complete, parent_bid = Sidekiq.redis do |r|
           r.multi do |pipeline|
-            pipeline.sadd("BID-#{bid}-failed", jid)
+            pipeline.sadd("BID-#{bid}-failed", [jid])
 
             pipeline.hincrby("BID-#{bid}", "pending", 0)
             pipeline.scard("BID-#{bid}-failed")
@@ -166,7 +205,7 @@ module Sidekiq
           Sidekiq.redis do |r|
             r.multi do |pipeline|
               pipeline.hincrby("BID-#{parent_bid}", "pending", 1)
-              pipeline.sadd("BID-#{parent_bid}-failed", jid)
+              pipeline.sadd("BID-#{parent_bid}-failed", [jid])
               pipeline.expire("BID-#{parent_bid}-failed", BID_EXPIRE_TTL)
             end
           end
@@ -188,8 +227,8 @@ module Sidekiq
             pipeline.hget("BID-#{bid}", "total")
             pipeline.hget("BID-#{bid}", "parent_bid")
 
-            pipeline.srem("BID-#{bid}-failed", jid)
-            pipeline.srem("BID-#{bid}-jids", jid)
+            pipeline.srem("BID-#{bid}-failed", [jid])
+            pipeline.srem("BID-#{bid}-jids", [jid])
             pipeline.expire("BID-#{bid}", BID_EXPIRE_TTL)
           end
         end
@@ -209,7 +248,7 @@ module Sidekiq
         already_processed, _, callbacks, queue, parent_bid, callback_batch = Sidekiq.redis do |r|
           r.multi do |pipeline|
             pipeline.hget(batch_key, event_name)
-            pipeline.hset(batch_key, event_name, true)
+            pipeline.hset(batch_key, event_name, 'true')
             pipeline.smembers(callback_key)
             pipeline.hget(batch_key, "callback_queue")
             pipeline.hget(batch_key, "parent_bid")
@@ -253,7 +292,7 @@ module Sidekiq
         else
           # Otherwise finalize in sub batch complete callback
           cb_batch = self.new
-          cb_batch.callback_batch = true
+          cb_batch.callback_batch = 'true'
           Sidekiq.logger.debug {"Adding callback batch: #{cb_batch.bid} for batch: #{bid}"}
           cb_batch.on(:complete, "Sidekiq::Batch::Callback::Finalize#dispatch", opts)
           cb_batch.jobs do
